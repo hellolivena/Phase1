@@ -1,0 +1,504 @@
+
+#%%
+######################## Connect Python ##################
+import snowflake.connector as snow
+import pandas as pd
+user= 'ayush.pandey1-cw@otsuka-us.com'
+
+conn = snow.connect(
+            host='otsuka_ctprod.us-east-1.snowflakecomputing.com',
+            database='cdr',
+            user= user,
+            authenticator='externalbrowser',account='otsuka_ctprod.us-east-1',port=443)
+
+
+cursor = conn.cursor()
+
+cursor.execute('USE DATABASE CDR')
+cursor.execute('USE SCHEMA operational_analytics')
+cursor.execute('USE WAREHOUSE OPA_MIG_M_WH')
+
+query = "SELECT REGION_NAME,FRIDAY_END,SALES,CALLS FROM CT_TREND_MDD_FIELD_SALE_CALL where region_name=geo_name"
+# query = "SELECT * FROM RSC_DATES"
+
+
+# Execute the query and load results into a Pandas DataFrame
+try:
+    weekly_sales_data= pd.read_sql(query, conn)
+    # Display the first 5 rows of the DataFrame
+finally:
+    conn.close()  
+
+#%%
+import pandas as pd
+import numpy as np
+from io import StringIO
+import itertools
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import MinMaxScaler
+import warnings
+import threading
+from datetime import datetime
+#%%
+week_data_dist=weekly_sales_data
+week_data=weekly_sales_data
+
+week_data['FRIDAY_END'] = pd.to_datetime(week_data['FRIDAY_END'], format='%Y-%m-%d')
+week_data = week_data[week_data["REGION_NAME"] == week_data["GEO_NAME"]]
+# Sort by date to ensure chronological order
+week_data = week_data.sort_values(by='FRIDAY_END')
+
+#%%
+def best_value_find(team,region_name,week_data):
+    global para_df
+    print("enter Region:",team,region,datetime.now())
+    team_name=team
+    week_data_region=week_data
+    reg_name=region_name
+    # Split into test (latest 10 weeks) and train (remaining data)
+    test_df = week_data_region.tail(12)  # Latest 10 weeks
+    train_df = week_data_region.iloc[:-12]  # Rest of the data
+    
+    train_data = train_df['SALES']
+    train_data_calls=train_df['CALLS']
+    full_data=week_data_region['SALES']
+    full_data_calls=week_data_region['CALLS']
+    test_data = test_df['SALES']
+    test_data_calls=test_df['CALLS']
+    
+    
+    # Ignore all warnings
+    warnings.filterwarnings("ignore")
+    
+    # Define parameter ranges
+    p = range(1, 2)   # p: 0-4
+    d = range(0, 1)   # d: 0-1
+    q = range(1, 2)   # q: 0-4
+    P = range(0, 2)   # P: 0-3
+    D = range(1, 2)   # D: 0-1
+    Q = range(0, 3)   # Q: 0-3
+    m = 52            # Seasonal period (monthly data)
+    
+    # Create a list to store results
+    results = []
+    i = 1
+    # print(2)
+    # Loop through all parameter combinations
+    for (p_val, d_val, q_val, P_val, D_val, Q_val) in itertools.product(p, d, q, P, D, Q):
+        # print("R:",reg_name,"C:",i)
+        i += 1
+    
+        try:
+            # Fit SARIMA model
+            model = SARIMAX(
+                train_data_calls,
+                order=(p_val, d_val, q_val),
+                seasonal_order=(P_val, D_val, Q_val, m),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                # exog=train_data_calls
+            )
+            fitted_model = model.fit(disp=False)
+            forecast_values = fitted_model.forecast(steps=len(test_data_calls))
+            # Adjust the index of the forecast values to match the test data
+            forecast_values.index = test_data.index
+            
+            # Calculate evaluation metrics
+            mae = mean_absolute_error(test_data, forecast_values)
+            rmse = np.sqrt(mean_squared_error(test_data, forecast_values))
+            
+            # Max-Min Differences
+            max_min_actual = test_data.max() - test_data.min()
+            max_min_fitted = forecast_values.max() - forecast_values.min()
+        
+            # Calculate the count of same slope trends (i.e., compare differences between successive data points)
+            actual_diff = np.sign(np.diff(test_data))  # Sign of the difference between successive points
+            fitted_diff = np.sign(np.diff(forecast_values))  # Same for fitted values
+            same_slope_count = np.sum(actual_diff == fitted_diff)
+            
+            # Store results
+            results.append({
+                'order': (p_val, d_val, q_val),
+                'seasonal_order': (P_val, D_val, Q_val, m),
+                'AIC': fitted_model.aic,
+                'MAE': mae,
+                'RMSE': rmse,
+                'Max-Min Actual': max_min_actual,
+                'Max-Min Fitted': max_min_fitted,
+                'Count Same Slope Trend': same_slope_count
+            })
+            
+        except Exception as e:
+            # Handle any errors (e.g., convergence issues)
+            print(f"Error for parameters: p={p_val}, d={d_val}, q={q_val}, P={P_val}, D={D_val}, Q={Q_val}, m={m}")
+            print(str(e))
+    
+    # Convert results to DataFrame for better visualization
+    results_df= pd.DataFrame(results)
+    # print(3)
+    # print("Loop1:",team,reg_name)
+    df=results_df[['order','seasonal_order','AIC','MAE','RMSE','Max-Min Fitted','Count Same Slope Trend']]
+    # df
+    min_max_scaler = MinMaxScaler()
+    max_scaler = MinMaxScaler(feature_range=(0, 1))
+    # print(4)
+    
+    # Normalize columns to be minimized (AIC, MAE, RMSE, Max-Min Fitted)
+    df[['aic2_scaled', 'mse_scaled', 'rmse2_scaled', 'fitted_diff_scaled']] = min_max_scaler.fit_transform(df[['AIC', 'MAE', 'RMSE', 'Max-Min Fitted']])
+    
+    # Normalize the column to be maximized (Count Same Slope Trend) - we use max scaler to maximize it
+    df['count_scaled'] = max_scaler.fit_transform(df[['Count Same Slope Trend']])
+    # print(5)
+    
+    # Calculate a combined score. Minimized columns contribute negatively, maximized column contributes positively.
+    df['score'] = (
+    0.05 * df['aic2_scaled'] + 0.3* df['mse_scaled'] + 0.45 * df['rmse2_scaled'] + 0.2 * df['fitted_diff_scaled']-0.3*df['count_scaled'])
+    # df['score'] = (df['aic2_scaled'] + df['mse_scaled'] + df['rmse2_scaled'] + df['fitted_diff_scaled']) - df['count_scaled']
+    
+    # Sort the DataFrame by the score in ascending order (lowest score is best)
+    df_sorted = df.sort_values(by='score', ascending=True)
+    # print(6)
+    
+    # Select the top 5 most optimized rows (lowest scores)
+    best_value = df_sorted.head(1)
+    
+    # Output the top 5 most optimized rows
+    # best_value
+    # print(7)
+    # Convert the single row to a dictionary
+    row_dict = best_value.iloc[0].to_dict()
+    
+    # Extract p, d, q from 'order' and P, D, Q from 'seasonal_order'
+    order = row_dict['order']
+    seasonal_order = row_dict['seasonal_order']
+    
+    # Extract values from the tuples
+    p1, d1, q1 = order
+    P1, D1, Q1, m = seasonal_order  # m is not needed for extraction
+    
+    
+    model = SARIMAX(
+            full_data_calls,
+            order=(p1, d1, q1),
+            seasonal_order=(P1, D1, Q1, m),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+            # exog=train_data_calls
+        )
+    fitted_model = model.fit(disp=False)
+    Forecasted_calls = fitted_model.forecast(steps=12)
+    # print(8)
+    
+    # Assuming `forecast` is the array of predicted values
+    mean_data = (full_data_calls.mean())
+    max_data = (full_data_calls.max())
+    max_value=(max_data/mean_data)*1.1*mean_data
+    min_value= (mean_data/max_data)*0.8*mean_data
+    
+    # Clip the forecasted values
+    forecasted_calls = np.clip(Forecasted_calls, min_value, max_value)
+    
+    # Ignore all warnings
+    warnings.filterwarnings("ignore")
+    
+    # Define parameter ranges
+    p = range(1, 2)   # p: 0-4
+    d = range(0, 1)   # d: 0-1
+    q = range(1, 2)   # q: 0-4
+    P = range(0, 2)   # P: 0-3
+    D = range(1, 2)   # D: 0-1
+    Q = range(0, 3)   # Q: 0-3
+    m = 52            # Seasonal period (monthly data)
+    
+    # Create a list to store results
+    results = []
+    i = 1
+    # print(9)
+    
+    # Loop through all parameter combinations
+    for (p_val, d_val, q_val, P_val, D_val, Q_val) in itertools.product(p, d, q, P, D, Q):
+        print("R:",reg_name,"SC:",i)
+        i += 1
+        
+        try:
+            # Fit SARIMA model
+            model = SARIMAX(
+                train_data,
+                order=(p_val, d_val, q_val),
+                seasonal_order=(P_val, D_val, Q_val, m),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                exog=train_data_calls
+            )
+            fitted_model = model.fit(disp=False)
+            forecast_values = fitted_model.forecast(steps=len(test_data), exog=test_data_calls)
+            # Adjust the index of the forecast values to match the test data
+            forecast_values.index = test_data.index
+            
+            # Calculate evaluation metrics
+            mae = mean_absolute_error(test_data, forecast_values)
+            rmse = np.sqrt(mean_squared_error(test_data, forecast_values))
+            
+            # Max-Min Differences
+            max_min_actual = test_data.max() - test_data.min()
+            max_min_fitted = forecast_values.max() - forecast_values.min()
+        
+            # Calculate the count of same slope trends (i.e., compare differences between successive data points)
+            actual_diff = np.sign(np.diff(test_data))  # Sign of the difference between successive points
+            fitted_diff = np.sign(np.diff(forecast_values))  # Same for fitted values
+            same_slope_count = np.sum(actual_diff == fitted_diff)
+            
+            # Store results
+            results.append({
+                'order': (p_val, d_val, q_val),
+                'seasonal_order': (P_val, D_val, Q_val, m),
+                'AIC': fitted_model.aic,
+                'MAE': mae,
+                'RMSE': rmse,
+                'Max-Min Actual': max_min_actual,
+                'Max-Min Fitted': max_min_fitted,
+                'Count Same Slope Trend': same_slope_count
+            })
+            
+        except Exception as e:
+            # Handle any errors (e.g., convergence issues)
+            print(f"Error for parameters: p={p_val}, d={d_val}, q={q_val}, P={P_val}, D={D_val}, Q={Q_val}, m={m}")
+            print(str(e))
+    # print(10)
+    
+    # Convert results to DataFrame for better visualization
+    results_df_2 = pd.DataFrame(results)
+    df=results_df_2[['order','seasonal_order','AIC','MAE','RMSE','Max-Min Fitted','Count Same Slope Trend']]
+    # df
+        
+    # Initialize scalers
+    min_max_scaler = MinMaxScaler()
+    max_scaler = MinMaxScaler(feature_range=(0, 1))
+    
+    # Normalize columns to be minimized (AIC, MAE, RMSE, Max-Min Fitted)
+    df[['aic2_scaled', 'mse_scaled', 'rmse2_scaled', 'fitted_diff_scaled']] = min_max_scaler.fit_transform(df[['AIC', 'MAE', 'RMSE', 'Max-Min Fitted']])
+    
+    # Normalize the column to be maximized (Count Same Slope Trend) - we use max scaler to maximize it
+    df['count_scaled'] = max_scaler.fit_transform(df[['Count Same Slope Trend']])
+    
+    # Calculate a combined score. Minimized columns contribute negatively, maximized column contributes positively.
+    df['score'] = (
+    0.05 * df['aic2_scaled'] + 0.3* df['mse_scaled'] + 0.45 * df['rmse2_scaled'] + 0.2 * df['fitted_diff_scaled']-0.3*df['count_scaled'])
+    # df['score'] = (df['aic2_scaled'] + df['mse_scaled'] + df['rmse2_scaled'] + df['fitted_diff_scaled']) - df['count_scaled']
+    
+    # Sort the DataFrame by the score in ascending order (lowest score is best)
+    df_sorted = df.sort_values(by='score', ascending=True)
+    
+    # Select the top 5 most optimized rows (lowest scores)
+    best_value_2 = df_sorted.head(1)
+    # print(11)
+    # Convert the single row to a dictionary
+    row_dict = best_value_2.iloc[0].to_dict()
+    # print("Loop2:",team,reg_name)
+    # Extract p, d, q from 'order' and P, D, Q from 'seasonal_order'
+    order = row_dict['order']
+    seasonal_order = row_dict['seasonal_order']
+    # print(12)
+    # Extract values from the tuples
+    p2, d2, q2 = order
+    P2, D2, Q2, m = seasonal_order  # m is not needed for extraction
+    
+    para_reg=[team_name,reg_name,p1,d1,q1,P1,D1,Q1,p2,d2,q2,P2,D2,Q2]
+    para_reg_df = pd.DataFrame([para_reg], columns=['team','reg_name','p1','d1','q1','P1','D1','Q1','p2','d2','q2','P2','D2','Q2'])
+    print("exit Region:",team,region,datetime.now())
+    return para_reg_df
+
+#%%
+para_col=['team','reg_name','p1','d1','q1','P1','D1','Q1','p2','d2','q2','P2','D2','Q2']
+para_df=pd.DataFrame(columns=para_col)
+
+# Lock for thread safety
+lock = threading.Lock()
+
+# Thread target function
+def threaded_best_value(team,region, region_data):
+    global para_df
+    # Compute best value
+    result = best_value_find(team,region, region_data)
+    
+    # Safely append to para_df
+    with lock:
+        para_df = pd.concat([para_df, result], ignore_index=True)
+
+# List to store threads
+threads = []
+
+# Start threads for each region
+for team in week_data['TEAM'].unique():
+    for region in week_data['REGION_NAME'].unique():
+        region_data = week_data[(week_data['REGION_NAME'] == region) & (week_data['TEAM'] == team)]
+        # print (region_data.head(1))
+        thread = threading.Thread(target=threaded_best_value, args=(team,region, region_data))
+        thread.start()
+        threads.append(thread)
+
+# Wait for all threads to complete
+for thread in threads:
+    thread.join()
+
+# Final output
+print("Final DataFrame:")
+print(para_df)
+
+final_df=para_df
+#%%
+week_data_dist['FRIDAY_END'] = pd.to_datetime(week_data_dist['FRIDAY_END'], format='%Y-%m-%d')
+
+#%%
+def forecast_region_data(team_name,geo_name,reg,dist_data,p1,d1,q1,P1,D1,Q1,p2,d2,q2,P2,D2,Q2):
+    team=team_name
+    region=reg
+    geo=geo_name
+    geo_data=dist_data
+    geo_data_sales=geo_data['SALES']
+    geo_data_calls=geo_data['CALLS']
+    m=52
+    warnings.filterwarnings("ignore")
+    model = SARIMAX(
+                geo_data_calls,
+                order=(p1, d1, q1),
+                seasonal_order=(P1, D1, Q1, m),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                # exog=full_data_calls
+            )
+    fitted_model = model.fit(disp=False)
+    Forecasted_calls = fitted_model.forecast(steps=12)
+    # print(Forecasted_calls)
+    mean_data = (geo_data_calls.mean())
+    max_data = (geo_data_calls.max())
+    max_value=(max_data/mean_data)*1.1*mean_data
+    min_value= (mean_data/max_data)*0.8*mean_data
+    # Clip the forecasted values
+    forecasted_calls = np.clip(Forecasted_calls, min_value, max_value)
+    # print(forecasted_calls)
+    
+    model = SARIMAX(
+                geo_data_sales,
+                order=(p2, d2, q2),
+                seasonal_order=(P2, D2, Q2, m),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                exog=geo_data_calls
+            )
+    fitted_model = model.fit(disp=False)
+    Forecasted_sales = fitted_model.forecast(steps=12,exog=forecasted_calls)
+    mean_data = (geo_data_sales.mean())
+    max_data = (geo_data_sales.max())
+    max_value=(max_data/mean_data)*1.1*mean_data
+    min_value= (mean_data/max_data)*0.8*mean_data
+    # Clip the forecasted values
+    forecasted_sales = np.clip(Forecasted_sales, min_value, max_value)
+    # print(forecasted_sales)
+    last_date = geo_data['FRIDAY_END'].max()
+    forecast_dates = [last_date + pd.Timedelta(weeks=i) for i in range(1, 13)]
+    forecast_data = pd.DataFrame({
+        "FRIDAY_END": forecast_dates,
+        "SALES": forecasted_sales,
+        "CALLS": forecasted_calls,
+        "SALE_TYPE": "Forecast"  # Set sale type to "Forecast"
+    })
+    # print(forecast_data)
+    geo_data['SALE_TYPE'] = "Actual"
+    forecast_data['REGION_NAME'] = region
+    forecast_data['GEO_NAME'] = geo
+    forecast_data['TEAM'] = team
+    
+    
+    combined_data = pd.concat([geo_data, forecast_data], ignore_index=True)
+    return combined_data
+#%%
+
+col_data = ["TEAM", "REGION_NAME", "GEO_NAME", "FRIDAY_END", "SALES", "CALLS", "SALE_TYPE"]
+final_forecast = pd.DataFrame(columns=col_data)
+
+comb_data_list = []
+for team, region, geo in week_data_dist[['TEAM', 'REGION_NAME', 'GEO_NAME']].drop_duplicates().values:
+    print(team, region, geo)
+    geo_data = week_data_dist[(week_data_dist['GEO_NAME'] == geo) & 
+                              (week_data_dist['TEAM'] == team) & 
+                              (week_data_dist['REGION_NAME'] == region)]
+    
+    region_best_value = final_df[(final_df['reg_name'] == region) & (final_df['team'] == team)]
+    if region_best_value.empty:
+        print(f"No matching data for team: {team}, region: {region}")
+        continue
+
+    # Ensure numeric casting
+    region_best_value = region_best_value.astype({
+        'p1': 'int', 'd1': 'int', 'q1': 'int',
+        'P1': 'int', 'D1': 'int', 'Q1': 'int',
+        'p2': 'int', 'd2': 'int', 'q2': 'int',
+        'P2': 'int', 'D2': 'int', 'Q2': 'int'
+    })
+
+    p1 = region_best_value['p1'].iloc[0]
+    d1 = region_best_value['d1'].iloc[0]
+    q1 = region_best_value['q1'].iloc[0]
+    P1 = region_best_value['P1'].iloc[0]
+    D1 = region_best_value['D1'].iloc[0]
+    Q1 = region_best_value['Q1'].iloc[0]
+    p2 = region_best_value['p2'].iloc[0]
+    d2 = region_best_value['d2'].iloc[0]
+    q2 = region_best_value['q2'].iloc[0]
+    P2 = region_best_value['P2'].iloc[0]
+    D2 = region_best_value['D2'].iloc[0]
+    Q2 = region_best_value['Q2'].iloc[0]
+
+    comb_data = forecast_region_data(team, region, geo, geo_data, p1, d1, q1, P1, D1, Q1, p2, d2, q2, P2, D2, Q2)
+    if not isinstance(comb_data, pd.DataFrame):
+        raise ValueError("forecast_region_data must return a DataFrame")
+    comb_data_list.append(comb_data)
+
+final_forecast = pd.concat(comb_data_list, ignore_index=True)
+#%%
+final_forecast.to_csv('final_forecast.csv',index=False,header=False)
+
+#%%
+user= 'ayush.pandey1-cw@otsuka-us.com'
+
+conn = snow.connect(
+            host='otsuka_ctprod.us-east-1.snowflakecomputing.com',
+            database='cdr',
+            user= user,
+            authenticator='externalbrowser',account='otsuka_ctprod.us-east-1',port=443)
+
+
+cursor = conn.cursor()
+#%%
+cursor.execute('USE DATABASE CDR')
+cursor.execute('USE SCHEMA operational_analytics')
+cursor.execute('USE WAREHOUSE OPA_MIG_M_WH')
+cursor.execute("""CREATE OR REPLACE TABLE CT_TREND_FIELD_SALES_CALL (
+    TEAM STRING,
+    REGION_NAME STRING,
+    GEO_NAME STR
+    FRIDAY_END STRING,
+    SALES STRING,
+    CALLS STRING,
+    SALE_TYPE STRING
+);""")
+#%%
+# Create a Snowflake internal stage (if it doesn't exist)
+cursor.execute("CREATE OR REPLACE STAGE my_stage")
+
+# Upload CSV file to Snowflake stage
+cursor.execute("PUT file://final_forecast.csv @my_stage")
+#%%
+# Step 3: Copy data from the stage into the Snowflake table
+cursor.execute("""
+    COPY INTO CT_TREND_FIELD_SALES_CALL
+    FROM @my_stage/final_forecast.csv
+    FILE_FORMAT = (TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY='"')
+""")
+
+print("Data loaded into Snowflake successfully.")
+
+cursor.close()
+conn.close()
